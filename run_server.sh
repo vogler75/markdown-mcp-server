@@ -13,5 +13,5 @@ if [ ! -f "$VENV_PYTHON" ]; then
 fi
 
 # Run the server with any additional arguments
-echo "Starting Markdown MCP Server with stdio transport..."
+echo "Starting Markdown MCP Server ..."
 exec "$VENV_PYTHON" "$SCRIPT_DIR/server.py" "$@"

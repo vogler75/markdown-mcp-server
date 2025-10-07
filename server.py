@@ -20,6 +20,9 @@ import mcp.server.stdio
 import mcp.types as types
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+from starlette.requests import Request
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -36,15 +39,55 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("markdown-mcp-server")
 
 
+class BearerTokenAuthMiddleware(BaseHTTPMiddleware):
+    """Middleware to validate Bearer token authentication."""
+
+    def __init__(self, app, token: str):
+        super().__init__(app)
+        self.required_token = token
+
+    async def dispatch(self, request: Request, call_next):
+        # Allow OPTIONS requests for CORS preflight
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Get Authorization header
+        auth_header = request.headers.get("Authorization")
+
+        if not auth_header:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Missing Authorization header"}
+            )
+
+        # Check if it's a Bearer token
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Invalid Authorization header format. Expected 'Bearer <token>'"}
+            )
+
+        # Extract and validate token
+        token = auth_header[7:]  # Remove "Bearer " prefix
+        if token != self.required_token:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Invalid token"}
+            )
+
+        # Token is valid, proceed with request
+        return await call_next(request)
+
+
 class MarkdownChapter:
     """Represents a markdown chapter with its content and metadata."""
-    
+
     def __init__(self, title: str, content: str, level: int, line_number: int):
         self.title = title
         self.content = content
         self.level = level
         self.line_number = line_number
-    
+
     def __repr__(self):
         return f"MarkdownChapter(title='{self.title}', level={self.level}, line={self.line_number})"
 
@@ -196,7 +239,7 @@ class MarkdownParser:
 parser: Optional[MarkdownParser] = None
 
 
-def setup_markdown_server(file_path: str, stateless: bool = False, json_response: bool = False, host: str = "127.0.0.1", port: int = 8000, streamable_http_path: str = "/mcp", enable_cors: bool = True, enable_resources: bool = False) -> FastMCP:
+def setup_markdown_server(file_path: str, stateless: bool = False, json_response: bool = False, host: str = "127.0.0.1", port: int = 8000, streamable_http_path: str = "/mcp", enable_cors: bool = True, enable_resources: bool = False, auth_token: Optional[str] = None) -> FastMCP:
     """Set up the FastMCP server with markdown functionality."""
     global parser
 
@@ -224,26 +267,34 @@ def setup_markdown_server(file_path: str, stateless: bool = False, json_response
             streamable_http_path=streamable_http_path
         )
 
-    # Add CORS middleware if enabled
-    if enable_cors:
-        # Wrap the streamable_http_app method to add CORS
+    # Add CORS and authentication middleware if enabled
+    if enable_cors or auth_token:
+        # Wrap the streamable_http_app method to add middleware
         original_streamable_http_app = mcp.streamable_http_app
 
-        def streamable_http_app_with_cors():
+        def streamable_http_app_with_middleware():
             app = original_streamable_http_app()
-            # Add CORS middleware to the app
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=["*"],  # Allow all origins
-                allow_credentials=True,
-                allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
-                allow_headers=["*"],
-                expose_headers=["Content-Type", "Authorization", "x-api-key", "Mcp-Session-Id"],
-                max_age=86400,
-            )
+
+            # Add authentication middleware if token is provided
+            if auth_token:
+                app.add_middleware(BearerTokenAuthMiddleware, token=auth_token)
+                logger.info("Bearer token authentication enabled")
+
+            # Add CORS middleware if enabled
+            if enable_cors:
+                app.add_middleware(
+                    CORSMiddleware,
+                    allow_origins=["*"],  # Allow all origins
+                    allow_credentials=True,
+                    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+                    allow_headers=["*"],
+                    expose_headers=["Content-Type", "Authorization", "x-api-key", "Mcp-Session-Id"],
+                    max_age=86400,
+                )
+
             return app
 
-        mcp.streamable_http_app = streamable_http_app_with_cors
+        mcp.streamable_http_app = streamable_http_app_with_middleware
 
     # Add resources only if enabled
     if enable_resources:
@@ -418,9 +469,9 @@ def main():
     arg_parser.add_argument(
         "--transport",
         type=str,
-        default="stdio",
+        default="streamable-http",
         choices=["stdio", "streamable-http"],
-        help="Transport protocol to use (default: stdio)"
+        help="Transport protocol to use (default: streamable-http)"
     )
     arg_parser.add_argument(
         "--stateless",
@@ -455,6 +506,12 @@ def main():
         action="store_true",
         help="Enable MCP resources (chapter URIs). By default only tools are enabled."
     )
+    arg_parser.add_argument(
+        "--auth-token",
+        type=str,
+        default="default-auth-token",
+        help="Bearer token for HTTP authentication (only applies to streamable-http transport)"
+    )
 
     args = arg_parser.parse_args()
     
@@ -488,8 +545,27 @@ def main():
     logger.info(f"MCP resources: {'enabled' if args.enable_resources else 'disabled (use --enable-resources to enable)'}")
     logger.info("=" * 60)
 
+    # Validate auth-token usage
+    if args.auth_token and args.transport not in ["streamable-http", "sse"]:
+        logger.warning("--auth-token is only applicable for streamable-http or sse transport. It will be ignored for stdio.")
+
+    # Log authentication status
+    if args.auth_token and args.transport in ["streamable-http", "sse"]:
+        logger.info("Authentication: Bearer token required")
+    else:
+        logger.info("Authentication: disabled")
+
     # Create and run server
-    mcp = setup_markdown_server(args.file, args.stateless, args.json_response, args.host, args.port, args.path, enable_resources=args.enable_resources)
+    mcp = setup_markdown_server(
+        args.file,
+        args.stateless,
+        args.json_response,
+        args.host,
+        args.port,
+        args.path,
+        enable_resources=args.enable_resources,
+        auth_token=args.auth_token if args.transport in ["streamable-http", "sse"] else None
+    )
     mcp.run(transport=args.transport)
 
 
